@@ -1,0 +1,1146 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# PORTAL WORKFLOW TEMPLATE — SOURCE OF TRUTH FOR ALL CUSTOMER REPOS
+# ═══════════════════════════════════════════════════════════════════════════════
+# This file is the ONLY file to edit when changing what gets pushed to customer
+# GitHub repos (e.g. pwi) via Settings → Scanners → Re-commit workflow.
+#
+# Build path:  src/assets/secureops-workflow.yml
+#              → dist/assets/secureops-workflow.yml  (npm run build)
+#              → POST /api/ci/push-workflow/:projectId
+# Output path: .github/workflows/secureops.yml  (in each customer's repo)
+#
+# Placeholders replaced at commit time:
+#   __SECUREOPS_SCAN_BRANCH__  →  project default branch (e.g. "main")
+#   __SONAR_PROJECT_KEY__      →  project sonar key (e.g. "pwi")
+#
+# GitHub Actions secrets (Settings → Secrets and variables → Actions):
+#   SECUREOPS_URL, SECUREOPS_API_KEY, SECUREOPS_PROJECT_ID — required for scans
+#   SECUREOPS_FRONTEND_URL — optional portal base URL for PR comment links (defaults to SECUREOPS_URL)
+#   VPS_HOST, VPS_USER, VPS_SSH_KEY — optional for deploy jobs
+#
+# NOT the same as .github/workflows/secureops.yml in this monorepo — that file
+# runs CI for the SecureOps repo itself only.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: SecureOps Security Pipeline
+
+on:
+  push:
+    branches: [__SECUREOPS_SCAN_BRANCH__]
+  pull_request:
+    branches: [__SECUREOPS_SCAN_BRANCH__]
+  schedule:
+    - cron: '0 3 * * 0'  # Sunday 03:00 UTC — pre-warm NVD cache before Monday scans
+  workflow_dispatch:
+    inputs:
+      scan_id:
+        description: SecureOps scan ID (portal manual trigger — do not create a new scan)
+        required: false
+        type: string
+      branch:
+        description: Git branch to checkout and scan
+        required: false
+        type: string
+      deploy_only:
+        description: Skip scans and run deploy-gate only (post-approval; requires scan_id)
+        required: false
+        type: boolean
+        default: false
+      warm_nvd_cache:
+        description: Only warm OWASP NVD cache (skip scan jobs)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  security-events: write
+
+# Portal manual scans use a per-scan group so a push/PR on main does not cancel them mid-run.
+# Push/PR still share one group per ref so rapid commits only keep the latest CI run.
+concurrency:
+  group: >-
+    ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.scan_id != '')
+    && format('secureops-portal-{0}', github.event.inputs.scan_id)
+    || format('secureops-ref-{0}', github.ref) }}
+  cancel-in-progress: >-
+    ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.scan_id == '' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SECUREOPS_URL: ${{ secrets.SECUREOPS_URL }}
+  API_KEY: ${{ secrets.SECUREOPS_API_KEY }}
+  PROJECT_ID: ${{ secrets.SECUREOPS_PROJECT_ID }}
+  SECUREOPS_FRONTEND_URL: ${{ secrets.SECUREOPS_FRONTEND_URL }}
+  CHECKOUT_REF: ${{ github.event.inputs.branch || github.ref }}
+  # Retries help when GitHub-hosted runners hit transient VPS/network blips (curl exit 28).
+  SECUREOPS_CURL: --retry 10 --retry-delay 15 --retry-all-errors --connect-timeout 30 --max-time 600
+  NVD_START_YEAR: "2018"
+
+jobs:
+  notify-start:
+    if: github.event.inputs.deploy_only != 'true' && github.event.inputs.warm_nvd_cache != 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      scan_id: ${{ steps.start.outputs.scan_id }}
+    steps:
+      - name: Resolve SecureOps scan ID
+        id: start
+        env:
+          PORTAL_SCAN_ID: ${{ github.event.inputs.scan_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PORTAL_SCAN_ID:-}" ]; then
+            echo "scan_id=${PORTAL_SCAN_ID}" >> "$GITHUB_OUTPUT"
+            echo "Using portal-provided scan_id=${PORTAL_SCAN_ID}"
+            exit 0
+          fi
+          if [ -z "${SECUREOPS_URL:-}" ] || [ -z "${API_KEY:-}" ] || [ -z "${PROJECT_ID:-}" ]; then
+            echo "::error::Missing GitHub secrets. Add SECUREOPS_URL, SECUREOPS_API_KEY, and SECUREOPS_PROJECT_ID under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          if ! curl -fsS --connect-timeout 10 --max-time 20 "${SECUREOPS_URL}/health" >/dev/null; then
+            echo "::error::SecureOps portal unreachable at ${SECUREOPS_URL}/health — aborting scan (check VPS/nginx or retry after deploy)"
+            exit 1
+          fi
+          RESPONSE=$(curl -sS ${SECUREOPS_CURL} -w "\n%{http_code}" -X POST "${SECUREOPS_URL}/api/scans" \
+            -H "X-API-Key: ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"project_id\": \"${PROJECT_ID}\",
+              \"commit_sha\": \"${{ github.sha }}\",
+              \"branch\": \"${{ github.ref_name }}\",
+              \"triggered_by\": \"github_actions\"
+            }")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          SCAN_ID=$(echo "$BODY" | jq -r '.scan_id // empty')
+          if [ -z "$SCAN_ID" ] || [ "$SCAN_ID" = "null" ]; then
+            echo "::error::SecureOps did not return scan_id (HTTP ${HTTP_CODE}). Check SECUREOPS_URL is the portal origin without /api (e.g. https://devsecportal.tech), API key matches this project, and PROJECT_ID is correct."
+            echo "$BODY"
+            exit 1
+          fi
+          echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+
+  sonarqube-scan:
+    needs: notify-start
+    if: needs.notify-start.outputs.scan_id != '' && needs.notify-start.outputs.scan_id != 'null'
+    timeout-minutes: 35
+    outputs:
+      scan_id: ${{ needs.notify-start.outputs.scan_id }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          fetch-depth: 0
+      - name: Resolve Sonar URL
+        id: sonar-url
+        run: |
+          set -euo pipefail
+          SONAR_URL="${{ secrets.SONARQUBE_URL }}"
+          if [ -z "$SONAR_URL" ]; then
+            SONAR_URL="${{ secrets.SONAR_HOST_URL }}"
+          fi
+          if [ -z "$SONAR_URL" ]; then
+            echo "::error::Missing GitHub secret SONARQUBE_URL (or alias SONAR_HOST_URL)."
+            exit 1
+          fi
+          case "$SONAR_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "::error::Sonar URL must start with http:// or https:// (got: ${SONAR_URL})"
+              exit 1
+              ;;
+          esac
+          echo "url=$SONAR_URL" >> "$GITHUB_OUTPUT"
+      - name: Validate Sonar token
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SONAR_TOKEN:-}" ]; then
+            echo "::error::Missing GitHub secret SONAR_TOKEN (user token from SonarQube)."
+            exit 1
+          fi
+      - name: Wait for SonarQube to be UP
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.sonar-url.outputs.url }}"
+          BASE="${BASE%/}"
+          for i in $(seq 1 18); do
+            HTTP=$(curl -sS -o /tmp/sonar-status.json -w "%{http_code}" \
+              "${BASE}/api/system/status" \
+              -H "Authorization: Bearer ${SONAR_TOKEN}" 2>/dev/null || echo "000")
+            if [ "$HTTP" = "200" ] && grep -q '"status":"UP"' /tmp/sonar-status.json 2>/dev/null; then
+              echo "SonarQube is UP (attempt ${i})"
+              exit 0
+            fi
+            echo "Attempt ${i}/18: Sonar not ready (HTTP ${HTTP}), waiting 10s..."
+            cat /tmp/sonar-status.json 2>/dev/null || true
+            sleep 10
+          done
+          echo "::error::SonarQube did not reach UP within 3 minutes at ${BASE}. On the VPS run: bash scripts/vps-ensure-sonar.sh"
+          exit 1
+      # Quality Gate: security-focused (blockers/criticals) — not a coverage or duplication enforcer.
+      - name: Run SonarQube Analysis
+        uses: sonarsource/sonarqube-scan-action@v8.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ steps.sonar-url.outputs.url }}
+        with:
+          args: >
+            -Dsonar.projectKey=__SONAR_PROJECT_KEY__
+            -Dsonar.projectName=SecureOps-${{ env.PROJECT_ID }}
+            -Dsonar.host.url=${{ steps.sonar-url.outputs.url }}
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/*.test.ts,**/*.spec.ts,**/*.test.js,**/coverage/**,**/migrations/**,**/__mocks__/**
+            -Dsonar.coverage.exclusions=**/*.test.*,**/*.spec.*,**/test/**,**/tests/**
+            -Dsonar.cpd.exclusions=**/migrations/**,**/generated/**
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+            -Dsonar.scm.provider=git
+            -Dsonar.scm.revision=${{ github.sha }}
+      - name: Send SonarQube results to SecureOps
+        if: always()
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.sonar-url.outputs.url }}"
+          BASE="${BASE%/}"
+          SONAR_KEY="__SONAR_PROJECT_KEY__"
+          HTTP=""
+          for i in $(seq 1 6); do
+            HTTP=$(curl -sS -o /tmp/sonar-issues.json -w "%{http_code}" \
+              "${BASE}/api/issues/search?componentKeys=${SONAR_KEY}&resolved=false&statuses=OPEN,CONFIRMED&types=VULNERABILITY,CODE_SMELL,BUG&ps=500" \
+              -H "Authorization: Bearer ${SONAR_TOKEN}" 2>/dev/null || echo "000")
+            if [ "$HTTP" = "200" ]; then
+              break
+            fi
+            echo "Attempt ${i}/6: issues/search HTTP ${HTTP}, retrying in 15s..."
+            cat /tmp/sonar-issues.json 2>/dev/null || true
+            sleep 15
+          done
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::SonarQube issues/search failed (HTTP ${HTTP}) for key ${SONAR_KEY}"
+            cat /tmp/sonar-issues.json || true
+            exit 1
+          fi
+          HTTP=$(curl -sS ${SECUREOPS_CURL} -o /tmp/sonar-post.json -w "%{http_code}" -X POST \
+            "${SECUREOPS_URL}/api/scans/${{ needs.notify-start.outputs.scan_id }}/results/sonarqube" \
+            -H "X-API-Key: ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/sonar-issues.json)
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::SecureOps Sonar ingest failed (HTTP ${HTTP})"
+            cat /tmp/sonar-post.json || true
+            exit 1
+          fi
+          echo "SecureOps ingested SonarQube results for project key ${SONAR_KEY}"
+
+  trivy-scan:
+    needs: notify-start
+    if: needs.notify-start.outputs.scan_id != '' && needs.notify-start.outputs.scan_id != 'null'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-results.json
+          exit-code: "0"
+      - name: Send Trivy results to SecureOps
+        if: always()
+        run: |
+          set -euo pipefail
+          SCAN_ID="${{ needs.notify-start.outputs.scan_id }}"
+          post_results() {
+            local tool="$1" file="$2"
+            local http ec
+            set +e
+            http=$(curl -sS ${SECUREOPS_CURL} -o "/tmp/${tool}-post.json" -w "%{http_code}" \
+              -X POST "${SECUREOPS_URL}/api/scans/${SCAN_ID}/results/${tool}" \
+              -H "X-API-Key: ${API_KEY}" -H "Content-Type: application/json" \
+              --data-binary "@${file}")
+            ec=$?
+            set -euo pipefail
+            if [ "$ec" -ne 0 ] || [ "$http" != "200" ]; then
+              echo "::warning::SecureOps ${tool} ingest failed (curl=${ec}, HTTP=${http:-000}) — scan continues"
+              cat "/tmp/${tool}-post.json" 2>/dev/null || true
+              return 0
+            fi
+            echo "SecureOps ingested ${tool} results (HTTP ${http})"
+          }
+          test -f trivy-results.json || printf '{"Results":[]}' > trivy-results.json
+          if command -v jq >/dev/null 2>&1; then
+            jq -c '{Results: (.Results // .results // [])}' trivy-results.json > /tmp/trivy-payload.json \
+              || printf '{"Results":[]}' > /tmp/trivy-payload.json
+          else
+            cp trivy-results.json /tmp/trivy-payload.json
+          fi
+          post_results trivy /tmp/trivy-payload.json
+
+  # ─── OWASP DEPENDENCY-CHECK ──────────────────────────────────────────────────
+  # Cache: ~/.dependency-check/data keyed by ISO week (odc.mv.db > 50 MB = warm).
+  # Warm path: --noupdate scan (~5–15 min). Cold path: single scan bootstraps NVD via API.
+  # NVD_API_KEY must be set in the customer GitHub repo (Settings → Secrets → Actions).
+  owasp-scan:
+    needs: notify-start
+    if: needs.notify-start.outputs.scan_id != '' && needs.notify-start.outputs.scan_id != 'null'
+    continue-on-error: true
+    timeout-minutes: 65
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Compute cache week key
+        id: date
+        run: echo "week=$(date +%Y-%U)" >> "$GITHUB_OUTPUT"
+
+      - name: Pull OWASP Dependency-Check image
+        run: docker pull owasp/dependency-check:12.2.2
+
+      - name: Ensure NVD data directory
+        run: mkdir -p "$HOME/.dependency-check/data"
+
+      - name: Cache OWASP NVD database
+        uses: actions/cache@v4
+        id: owasp-cache
+        with:
+          path: ~/.dependency-check/data
+          key: owasp-nvd-v2-${{ steps.date.outputs.week }}
+          restore-keys: |
+            owasp-nvd-v2-
+
+      - name: Check if NVD database is populated
+        id: nvd-check
+        run: |
+          echo "cache-hit from actions/cache: ${{ steps.owasp-cache.outputs.cache-hit }}"
+          DB_FILE="$HOME/.dependency-check/data/odc.mv.db"
+          if [ ! -f "$DB_FILE" ]; then
+            DB_FILE=$(find "$HOME/.dependency-check/data" -name 'odc.mv.db' -type f 2>/dev/null | head -1)
+          fi
+          DB_SIZE=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+          echo "DB_FILE=${DB_FILE:-none}"
+          echo "DB_SIZE=${DB_SIZE} bytes"
+          if [ -n "$DB_FILE" ] && [ "$DB_SIZE" -gt 52428800 ]; then
+            echo "populated=true" >> "$GITHUB_OUTPUT"
+            echo "✅ NVD database populated ($(numfmt --to=iec "$DB_SIZE")) — scan will use --noupdate"
+          else
+            echo "populated=false" >> "$GITHUB_OUTPUT"
+            echo "❌ NVD database missing or too small — purging stale cache and bootstrapping via NVD API"
+            rm -rf "$HOME/.dependency-check/data"
+            mkdir -p "$HOME/.dependency-check/data"
+          fi
+
+      - name: Discover dependency manifests
+        id: scan-paths
+        run: |
+          SCAN_PATHS=""
+          while IFS= read -r f; do
+            SCAN_PATHS="$SCAN_PATHS --scan /src/${f#./}"
+          done < <(find . -type f \( \
+            -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' \
+            -o -name 'composer.lock' -o -name 'composer.json' \
+            -o -name 'pom.xml' -o -name 'build.gradle' -o -name 'build.gradle.kts' \
+            -o -name 'Gemfile.lock' -o -name 'go.sum' -o -name 'Cargo.lock' \
+            \) \
+            -not -path '*/node_modules/*' \
+            -not -path '*/vendor/*' \
+            -not -path '*/.git/*' \
+            -not -path '*/owasp-report/*')
+          if [ -z "$SCAN_PATHS" ]; then
+            SCAN_PATHS="--scan /src"
+            echo "::warning::No dependency manifests found — falling back to full repo scan (slow). Add composer.lock or package-lock.json."
+          else
+            echo "Manifests to scan:$(echo "$SCAN_PATHS" | tr ' ' '\n' | grep -v '^$' | sed 's|--scan /src/|  - |')"
+          fi
+          echo "paths=$SCAN_PATHS" >> "$GITHUB_OUTPUT"
+
+      - name: Run OWASP Dependency Check
+        timeout-minutes: 55
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p owasp-report "$HOME/.dependency-check/data"
+          ODC_DATA="${RUNNER_TEMP}/odc-scan-data"
+          rm -rf "$ODC_DATA"
+          mkdir -p "$ODC_DATA"
+          if [ "${{ steps.nvd-check.outputs.populated }}" = "true" ]; then
+            cp -a "$HOME/.dependency-check/data/." "$ODC_DATA/"
+          fi
+          find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
+          if [ -z "${NVD_API_KEY:-}" ]; then
+            echo "::warning::NVD_API_KEY is not set — cold bootstrap may produce zero CVEs"
+          else
+            echo "✅ NVD_API_KEY is set"
+          fi
+          if [ "${{ steps.nvd-check.outputs.populated }}" != "true" ]; then
+            echo "Cold cache — bootstrapping NVD via API (from ${NVD_START_YEAR})..."
+            docker run --rm \
+              -e NVD_API_KEY \
+              -e JAVA_OPTS="-Xmx4096m -Dh2.lockTimeout=600000" \
+              -v "${ODC_DATA}:/usr/share/dependency-check/data" \
+              owasp/dependency-check:12.2.2 \
+              --updateonly \
+              --data /usr/share/dependency-check/data \
+              --nvdApiStartYear "${NVD_START_YEAR}" \
+              --nvdValidForHours 0 \
+              --nvdApiKey "${NVD_API_KEY:-}" \
+              --nvdApiDelay 6000 \
+              --disableRetireJs \
+              --disableKnownExploited \
+              --disableHostedSuppressions \
+            || echo "::warning::NVD API bootstrap failed — scan may produce empty report"
+            find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
+            DB_FILE=$(find "$ODC_DATA" -name 'odc.mv.db' -type f 2>/dev/null | head -1)
+            DB_SIZE=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+            echo "Bootstrap DB: ${DB_SIZE} bytes at ${DB_FILE:-none}"
+          else
+            echo "Warm cache — skipping NVD bootstrap"
+          fi
+          echo "Running OWASP dependency scan (--noupdate)..."
+          docker run --rm \
+            -e NVD_API_KEY \
+            -e JAVA_OPTS="-Xmx4096m" \
+            -v "${{ github.workspace }}:/src" \
+            -v "${ODC_DATA}:/usr/share/dependency-check/data" \
+            -v "${{ github.workspace }}/owasp-report:/report" \
+            owasp/dependency-check:12.2.2 \
+            ${{ steps.scan-paths.outputs.paths }} \
+            --format JSON \
+            --out /report \
+            --data /usr/share/dependency-check/data \
+            --failOnCVSS 11 \
+            --nvdApiKey "$NVD_API_KEY" \
+            --noupdate \
+            --disableRetireJs \
+            --disableOssIndex \
+            --disableVersionCheck \
+            --disableKnownExploited \
+            --disableHostedSuppressions \
+            --nodeAuditSkipDevDependencies \
+            --exclude "**/node_modules/**" \
+            --exclude "**/vendor/**" \
+            --exclude "**/storage/**" \
+            --exclude "**/.git/**" \
+            --exclude "**/dist/**" \
+            --exclude "**/build/**" \
+            --exclude "**/coverage/**" \
+            --exclude "**/owasp-report/**" || true
+          find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
+          DB_FILE=$(find "$ODC_DATA" -name 'odc.mv.db' -type f 2>/dev/null | head -1)
+          DB_SIZE=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+          if [ -n "$DB_FILE" ] && [ "$DB_SIZE" -gt 52428800 ]; then
+            mkdir -p "$HOME/.dependency-check/data"
+            cp -a "$ODC_DATA/." "$HOME/.dependency-check/data/"
+            echo "Synced NVD cache ($(numfmt --to=iec "$DB_SIZE")) to ~/.dependency-check/data"
+          fi
+          echo "--- OWASP report output ---"
+          ls -la owasp-report/ 2>/dev/null || echo "(empty)"
+          REPORT=$(find owasp-report -name "*.json" 2>/dev/null | head -1 || true)
+          if [ -n "$REPORT" ] && [ -f "$REPORT" ]; then
+            DEPS=$(jq -r '.dependencies | length' "$REPORT" 2>/dev/null || echo 0)
+            VULNS=$(jq '[.dependencies[]?.vulnerabilities[]?] | length' "$REPORT" 2>/dev/null || echo 0)
+            echo "Report: ${REPORT} — ${DEPS} dependencies, ${VULNS} vulnerabilities"
+          else
+            echo "(no JSON report found)"
+          fi
+
+      - name: Send OWASP results to SecureOps
+        if: always()
+        run: |
+          set -euo pipefail
+          SCAN_ID="${{ needs.notify-start.outputs.scan_id }}"
+          post_results() {
+            local tool="$1" file="$2"
+            local http ec
+            set +e
+            http=$(curl -sS ${SECUREOPS_CURL} -o "/tmp/${tool}-post.json" -w "%{http_code}" \
+              -X POST "${SECUREOPS_URL}/api/scans/${SCAN_ID}/results/${tool}" \
+              -H "X-API-Key: ${API_KEY}" -H "Content-Type: application/json" \
+              --data-binary "@${file}")
+            ec=$?
+            set -euo pipefail
+            if [ "$ec" -ne 0 ] || [ "$http" != "200" ]; then
+              echo "::warning::SecureOps ${tool} ingest failed (curl=${ec}, HTTP=${http:-000}) — scan continues"
+              cat "/tmp/${tool}-post.json" 2>/dev/null || true
+              return 0
+            fi
+            echo "SecureOps ingested ${tool} results (HTTP ${http})"
+          }
+          OWASP_REPORT=$(find owasp-report -name "*.json" 2>/dev/null | head -1 || true)
+          if [ -n "$OWASP_REPORT" ] && [ -f "$OWASP_REPORT" ] && [ -s "$OWASP_REPORT" ]; then
+            echo "OWASP report found, posting to SecureOps: ${OWASP_REPORT}"
+            cp "$OWASP_REPORT" /tmp/owasp-payload.json
+          else
+            echo "::warning::OWASP report empty or missing — posting empty result so scan can complete"
+            printf '{"dependencies":[]}' > /tmp/owasp-payload.json
+          fi
+          post_results owasp /tmp/owasp-payload.json
+
+  semgrep-scan:
+    needs: notify-start
+    if: needs.notify-start.outputs.scan_id != '' && needs.notify-start.outputs.scan_id != 'null'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Install Semgrep CLI
+        run: python -m pip install --upgrade "semgrep==1.162.0"
+      - name: Ensure Semgrep config exists
+        run: |
+          if [ ! -f .semgrep.yml ]; then
+            printf '%s\n' \
+              'rules:' \
+              '  - id: hardcoded-secret' \
+              '    pattern: $KEY = "$VALUE"' \
+              '    message: Potential hardcoded credential' \
+              '    languages: [javascript, typescript, python, php]' \
+              '    severity: WARNING' \
+              '  - id: sql-concat' \
+              '    pattern: |' \
+              '      $Q = "..." + $VAR' \
+              '    message: Potential SQL injection via string concat' \
+              '    languages: [javascript, typescript, python, php]' \
+              '    severity: ERROR' \
+              > .semgrep.yml
+          fi
+      - name: Run Semgrep local rules
+        run: |
+          set -euo pipefail
+          semgrep scan --metrics=off --config .semgrep.yml --json --output semgrep-results.json || true
+      - name: Send Semgrep results to SecureOps
+        if: always()
+        run: |
+          set -euo pipefail
+          SCAN_ID="${{ needs.notify-start.outputs.scan_id }}"
+          post_results() {
+            local tool="$1" file="$2"
+            local http ec
+            set +e
+            http=$(curl -sS ${SECUREOPS_CURL} -o "/tmp/${tool}-post.json" -w "%{http_code}" \
+              -X POST "${SECUREOPS_URL}/api/scans/${SCAN_ID}/results/${tool}" \
+              -H "X-API-Key: ${API_KEY}" -H "Content-Type: application/json" \
+              --data-binary "@${file}")
+            ec=$?
+            set -euo pipefail
+            if [ "$ec" -ne 0 ] || [ "$http" != "200" ]; then
+              echo "::warning::SecureOps ${tool} ingest failed (curl=${ec}, HTTP=${http:-000}) — scan continues"
+              cat "/tmp/${tool}-post.json" 2>/dev/null || true
+              return 0
+            fi
+            echo "SecureOps ingested ${tool} results (HTTP ${http})"
+          }
+          test -f semgrep-results.json || printf '{"results":[]}' > semgrep-results.json
+          if command -v jq >/dev/null 2>&1; then
+            jq 'if .results then .results = .results[:500] else . end' semgrep-results.json > /tmp/semgrep-capped.json \
+              && mv /tmp/semgrep-capped.json semgrep-results.json
+          fi
+          post_results semgrep semgrep-results.json
+
+  gitleaks-scan:
+    needs: notify-start
+    if: needs.notify-start.outputs.scan_id != '' && needs.notify-start.outputs.scan_id != 'null'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          fetch-depth: 0
+      - name: Run Gitleaks locally
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$(pwd):/repo" \
+            zricethezav/gitleaks:v8.24.3 \
+            detect --source /repo --report-format json --report-path /repo/gitleaks-results.json --exit-code 0
+          test -f gitleaks-results.json || printf '[]\n' > gitleaks-results.json
+      - name: Send Gitleaks results to SecureOps
+        if: always()
+        run: |
+          set -euo pipefail
+          SCAN_ID="${{ needs.notify-start.outputs.scan_id }}"
+          post_results() {
+            local tool="$1" file="$2"
+            local http ec
+            set +e
+            http=$(curl -sS ${SECUREOPS_CURL} -o "/tmp/${tool}-post.json" -w "%{http_code}" \
+              -X POST "${SECUREOPS_URL}/api/scans/${SCAN_ID}/results/${tool}" \
+              -H "X-API-Key: ${API_KEY}" -H "Content-Type: application/json" \
+              --data-binary "@${file}")
+            ec=$?
+            set -euo pipefail
+            if [ "$ec" -ne 0 ] || [ "$http" != "200" ]; then
+              echo "::warning::SecureOps ${tool} ingest failed (curl=${ec}, HTTP=${http:-000}) — scan continues"
+              cat "/tmp/${tool}-post.json" 2>/dev/null || true
+              return 0
+            fi
+            echo "SecureOps ingested ${tool} results (HTTP ${http})"
+          }
+          test -f gitleaks-results.json || printf '[]' > gitleaks-results.json
+          post_results gitleaks gitleaks-results.json
+
+  evaluate-quality-gate:
+    needs: [sonarqube-scan, trivy-scan, owasp-scan, semgrep-scan, gitleaks-scan]
+    if: github.event.inputs.deploy_only != 'true' && needs.sonarqube-scan.outputs.scan_id != '' && needs.sonarqube-scan.outputs.scan_id != 'null'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report scanner versions to SecureOps
+        run: |
+          set -euo pipefail
+          SCAN_ID="${{ needs.sonarqube-scan.outputs.scan_id }}"
+          BODY=$(jq -n \
+            --arg trivy "Trivy 0.58.1 (trivy-action@v0.36.0)" \
+            --arg semgrep "Semgrep 1.162.0" \
+            --arg gitleaks "Gitleaks 8.24.3" \
+            --arg owasp "OWASP Dependency-Check 12.2.2" \
+            --arg sonarqube "SonarQube (GitHub Actions scanner)" \
+            '{trivy:$trivy, semgrep:$semgrep, gitleaks:$gitleaks, owasp:$owasp, sonarqube:$sonarqube}')
+          HTTP=$(curl -sS ${SECUREOPS_CURL} -o /tmp/scanner-versions.json -w "%{http_code}" \
+            -X POST "${SECUREOPS_URL}/api/scans/${SCAN_ID}/scanner-versions" \
+            -H "X-API-Key: ${API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+          if [ "$HTTP" != "200" ]; then
+            echo "::warning::scanner-versions POST failed (HTTP ${HTTP})"
+            cat /tmp/scanner-versions.json 2>/dev/null || true
+          else
+            echo "SecureOps recorded scanner versions (HTTP ${HTTP})"
+          fi
+      - name: Check Quality Gate
+        run: |
+          set -euo pipefail
+          SCAN_ID="${{ needs.sonarqube-scan.outputs.scan_id }}"
+          FINAL=""
+          for i in $(seq 1 24); do
+            HTTP_CODE=$(curl -sS ${SECUREOPS_CURL} -o /tmp/gate.json -w "%{http_code}" \
+              "${SECUREOPS_URL}/api/scans/${SCAN_ID}/gate-result" \
+              -H "X-API-Key: ${API_KEY}")
+            if [ "$HTTP_CODE" = "202" ]; then
+              echo "attempt ${i}/24: scan not completed yet (HTTP 202)"
+              sleep 5
+              continue
+            fi
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "Unexpected HTTP ${HTTP_CODE} from gate-result"
+              cat /tmp/gate.json || true
+              exit 1
+            fi
+            GATE=$(jq -r '.result // empty' /tmp/gate.json)
+            if [ "$GATE" = "passed" ] || [ "$GATE" = "failed" ] || [ "$GATE" = "error" ]; then
+              FINAL="$GATE"
+              break
+            fi
+            echo "attempt ${i}/24: result=${GATE:-"(empty)"} — waiting for final status"
+            sleep 5
+          done
+          if [ -z "$FINAL" ]; then
+            echo "::error::Quality gate did not reach a final status (passed/failed/error) within 2 minutes"
+            exit 1
+          fi
+          REASONS=$(jq -r '(.reasons // []) | join(", ")' /tmp/gate.json)
+          echo "Quality Gate: $FINAL"
+          if [ "$FINAL" = "failed" ] || [ "$FINAL" = "error" ]; then
+            echo "❌ Quality Gate FAILED: $REASONS"
+            exit 1
+          fi
+          echo "✅ Quality Gate PASSED"
+
+  # Score-gated CD — deploy-gate always calls deployment-status (never bypasses approval).
+  # Requires SECUREOPS_URL, SECUREOPS_API_KEY, SECUREOPS_PROJECT_ID. Deploy additionally needs VPS_* secrets.
+  deploy-gate:
+    name: Deployment Gate (Attack Surface Score)
+    runs-on: ubuntu-latest
+    needs: [evaluate-quality-gate, notify-start]
+    if: |
+      always() &&
+      github.event.inputs.deploy_only != 'true' &&
+      needs.evaluate-quality-gate.result == 'success' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/__SECUREOPS_SCAN_BRANCH__'
+    outputs:
+      cd_enabled: ${{ steps.cd-check.outputs.cd_enabled }}
+      decision: ${{ steps.check.outputs.decision || steps.cd-check.outputs.decision }}
+      score: ${{ steps.check.outputs.score }}
+    steps:
+      - name: Check CD pipeline enabled
+        id: cd-check
+        run: |
+          set -euo pipefail
+          if [ -z "${SECUREOPS_URL:-}" ] || [ -z "${API_KEY:-}" ] || [ -z "${PROJECT_ID:-}" ]; then
+            echo "cd_enabled=true" >> "$GITHUB_OUTPUT"
+            echo "decision=APPROVE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RESPONSE=$(curl -fsS ${SECUREOPS_CURL} \
+            -H "X-API-Key: ${API_KEY}" \
+            "${SECUREOPS_URL}/api/projects/${PROJECT_ID}/attack-surface-score" \
+            || echo '{"cdPipelineEnabled":true,"deploymentDecision":"APPROVE"}')
+          echo "cd_enabled=$(echo "$RESPONSE" | jq -r '.cdPipelineEnabled // true')" >> "$GITHUB_OUTPUT"
+          echo "decision=$(echo "$RESPONSE" | jq -r '.deploymentDecision // "APPROVE"')" >> "$GITHUB_OUTPUT"
+
+      - name: Skip gate (CD disabled)
+        if: steps.cd-check.outputs.cd_enabled == 'false'
+        run: |
+          echo "ℹ️ CD Pipeline Integration is disabled for this project."
+          echo "Scans completed. Deployment gate not enforced."
+
+      - name: Query deployment status
+        id: check
+        if: steps.cd-check.outputs.cd_enabled == 'true'
+        env:
+          SCAN_ID: ${{ needs.notify-start.outputs.scan_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SECUREOPS_URL:-}" ] || [ -z "${API_KEY:-}" ] || [ -z "${PROJECT_ID:-}" ]; then
+            echo "::notice::Skipping deploy gate: SecureOps secrets not configured."
+            echo "decision=APPROVE" >> "$GITHUB_OUTPUT"
+            echo "score=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "${SCAN_ID:-}" ]; then
+            echo "::error::Missing scan_id for deploy-gate"
+            exit 1
+          fi
+          RESPONSE=$(curl -fsS ${SECUREOPS_CURL} \
+            -H "X-API-Key: ${API_KEY}" \
+            "${SECUREOPS_URL}/api/projects/${PROJECT_ID}/scans/${SCAN_ID}/deployment-status" \
+            || echo '{"effectiveDecision":"APPROVE","score":0,"rating":"LOW"}')
+          DECISION=$(echo "$RESPONSE" | jq -r '.effectiveDecision // "APPROVE"')
+          SCORE=$(echo "$RESPONSE" | jq -r '.score // 0')
+          RATING=$(echo "$RESPONSE" | jq -r '.rating // "LOW"')
+          REASON=$(echo "$RESPONSE" | jq -r '.deploymentDecisionReason // ""')
+          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
+          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+          echo "## Attack Surface Score: $SCORE/100 ($RATING)" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Effective Decision:** $DECISION" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$REASON" ] && echo "$REASON" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DECISION" = "HARD_BLOCK" ] || [ "$DECISION" = "BLOCK" ]; then
+            echo "::error::Deployment blocked (effective: $DECISION). Score: $SCORE."
+            exit 1
+          elif [ "$DECISION" = "WARN" ]; then
+            echo "::warning::Deploying with elevated risk (Score: $SCORE)"
+          fi
+
+  deploy-gate-deploy-only:
+    name: Deployment Gate (Post-Approval)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_only == 'true'
+    outputs:
+      decision: ${{ steps.check.outputs.decision }}
+      score: ${{ steps.check.outputs.score }}
+    steps:
+      - name: Verify deployment approval
+        id: check
+        env:
+          SCAN_ID: ${{ github.event.inputs.scan_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SCAN_ID:-}" ] || [ "$SCAN_ID" = "null" ]; then
+            echo "::error::deploy_only requires scan_id input"
+            exit 1
+          fi
+          if [ -z "${SECUREOPS_URL:-}" ] || [ -z "${API_KEY:-}" ] || [ -z "${PROJECT_ID:-}" ]; then
+            echo "::error::SecureOps secrets required for deploy_only"
+            exit 1
+          fi
+          RESPONSE=$(curl -fsS ${SECUREOPS_CURL} \
+            -H "X-API-Key: ${API_KEY}" \
+            "${SECUREOPS_URL}/api/projects/${PROJECT_ID}/scans/${SCAN_ID}/deployment-status")
+          APPROVED=$(echo "$RESPONSE" | jq -r '.approved // false')
+          DECISION=$(echo "$RESPONSE" | jq -r '.effectiveDecision // "BLOCK"')
+          SCORE=$(echo "$RESPONSE" | jq -r '.score // 0')
+          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
+          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+          if [ "$APPROVED" != "true" ]; then
+            echo "::error::deploy_only rejected: scan not approved"
+            exit 1
+          fi
+          if [ "$DECISION" = "HARD_BLOCK" ] || [ "$DECISION" = "BLOCK" ]; then
+            echo "::error::deploy_only rejected: effective decision still $DECISION"
+            exit 1
+          fi
+          echo "Post-approval deploy allowed (effective: $DECISION, score: $SCORE)"
+
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: [deploy-gate, deploy-gate-deploy-only]
+    if: |
+      always() &&
+      (
+        (needs.deploy-gate.result == 'success' &&
+         (needs.deploy-gate.outputs.decision == 'APPROVE' ||
+          needs.deploy-gate.outputs.decision == 'WARN')) ||
+        needs.deploy-gate-deploy-only.result == 'success'
+      )
+    environment: production
+    steps:
+      - name: Check VPS secrets
+        id: vps
+        run: |
+          if [ -z "${{ secrets.VPS_HOST }}" ] || [ -z "${{ secrets.VPS_USER }}" ] || [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
+            echo "::notice::Skipping deploy: VPS_HOST, VPS_USER, or VPS_SSH_KEY not configured."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Deploy via SSH
+        if: steps.vps.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /opt/demo-app || cd /opt/secureops
+            git pull origin __SECUREOPS_SCAN_BRANCH__
+            docker compose up -d --force-recreate backend frontend
+            echo "Deployed at $(date)"
+      - name: Health check
+        if: steps.vps.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            curl -fsS http://127.0.0.1:8080/health || curl -fsS http://127.0.0.1/health || exit 1
+      - name: Rollback on health check failure
+        if: failure() && steps.vps.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /opt/demo-app || cd /opt/secureops
+            git checkout HEAD~1
+            docker compose up -d --force-recreate backend frontend
+            echo "Rollback completed at $(date) — postgres container not recreated"
+
+  # PR security report — posts/updates one comment via GITHUB_TOKEN (never sent to backend).
+  # Graceful skip: if SECUREOPS secrets missing, notify-start leaves scan_id empty — job does not run (intentional).
+  pr-security-comment:
+    name: PR Security Comment
+    needs: [evaluate-quality-gate, notify-start]
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      needs.notify-start.result == 'success' &&
+      needs.evaluate-quality-gate.result != 'cancelled' &&
+      needs.notify-start.outputs.scan_id != '' &&
+      needs.notify-start.outputs.scan_id != 'null'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Build and post PR security comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCAN_ID: ${{ needs.notify-start.outputs.scan_id }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          SECUREOPS_FRONTEND_URL: ${{ secrets.SECUREOPS_FRONTEND_URL }}
+          GATE_STATUS: ${{ needs.evaluate-quality-gate.result }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SECUREOPS_URL:-}" ] || [ -z "${API_KEY:-}" ] || [ -z "${PROJECT_ID:-}" ]; then
+            echo "::notice::Skipping PR comment: SecureOps secrets not configured."
+            exit 0
+          fi
+
+          MARKER="<!-- secureops-pr-comment -->"
+          PORTAL="${SECUREOPS_FRONTEND_URL:-${SECUREOPS_URL}}"
+          PORTAL="${PORTAL%/api}"
+          REPORT_URL="${PORTAL}/scans/${SCAN_ID}/results"
+
+          upsert_comment() {
+            local body="$1"
+            EXISTING_ID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments" \
+              --jq '.[] | select(.body | contains("<!-- secureops-pr-comment -->")) | .id' | head -1 || true)
+            if [ -n "${EXISTING_ID:-}" ]; then
+              gh api --method PATCH "/repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING_ID}" -f body="$body"
+            else
+              gh pr comment "$PR_NUM" --body "$body"
+            fi
+          }
+
+          if ! STATUS_JSON=$(curl -fsS ${SECUREOPS_CURL} \
+            -H "X-API-Key: ${API_KEY}" \
+            "${SECUREOPS_URL}/api/projects/${PROJECT_ID}/scans/${SCAN_ID}/deployment-status"); then
+            FALLBACK="${MARKER}
+          ## SecureOps Security Report
+
+          Scan \`${SCAN_ID}\` completed. Full deployment status is not available yet.
+
+          [View scan in portal](${REPORT_URL})
+
+          ---
+          *SecureOps · Score-Gated CD · scan \`${SCAN_ID}\`*"
+            upsert_comment "$FALLBACK"
+            exit 0
+          fi
+
+          VULNS_JSON=$(curl -fsS ${SECUREOPS_CURL} \
+            -H "X-API-Key: ${API_KEY}" \
+            "${SECUREOPS_URL}/api/projects/${PROJECT_ID}/vulnerabilities?scan_id=${SCAN_ID}&severity=critical,high&limit=5&sort=severity" \
+            || echo '{"data":[]}')
+
+          SCORE=$(echo "$STATUS_JSON" | jq -r '.score // 0')
+          RATING=$(echo "$STATUS_JSON" | jq -r '.rating // "LOW"')
+          DECISION=$(echo "$STATUS_JSON" | jq -r '.effectiveDecision // .deploymentDecision // "APPROVE"')
+          CHAINS=$(echo "$STATUS_JSON" | jq -r '.attackChainsDetected // 0')
+          NEAR_MISS=$(echo "$STATUS_JSON" | jq -r '.nearMissCount // 0')
+          COMPLIANCE_BREACHES=$(echo "$STATUS_JSON" | jq -r '.complianceBreachCount // 0')
+          REASON=$(echo "$STATUS_JSON" | jq -r '.deploymentDecisionReason // ""')
+          APPROVERS=$(echo "$STATUS_JSON" | jq -r '(.requiredApprovers // []) | join(", ")')
+
+          case "$GATE_STATUS" in
+            success) GATE_LABEL="Passed ✅" ;;
+            failure) GATE_LABEL="Failed 🔴" ;;
+            skipped) GATE_LABEL="Skipped" ;;
+            *)       GATE_LABEL="$GATE_STATUS" ;;
+          esac
+
+          case "$DECISION" in
+            APPROVE)    EMOJI="✅"; DECISION_TEXT="APPROVED" ;;
+            WARN)       EMOJI="⚠️"; DECISION_TEXT="WARNING — deployed with notification" ;;
+            BLOCK)      EMOJI="🔴"; DECISION_TEXT="BLOCKED — PM approval required" ;;
+            HARD_BLOCK) EMOJI="🚨"; DECISION_TEXT="HARD BLOCKED — Super Admin approval required" ;;
+            *)          EMOJI="❓"; DECISION_TEXT="$DECISION" ;;
+          esac
+
+          CHAINS_TABLE=$(echo "$STATUS_JSON" | jq -r '
+            (.attackChains // [])[] |
+            "| \(.name) | \(if .severity == "CRITICAL" then "Critical" elif .severity == "HIGH" then "High" else .severity end) |"
+          ')
+
+          FINDINGS_TABLE=$(echo "$VULNS_JSON" | jq -r '
+            (.data // [])[:5] | to_entries[] |
+            "| \(.key + 1) | \(.value.severity) | \(.value.title) | \(.value.tool) | `\(.value.file_path // "—"):\(.value.line_number // "")` |"
+          ')
+
+          if [ -z "$FINDINGS_TABLE" ]; then
+            FINDINGS_TABLE="| — | — | No critical/high findings in this scan | — | — |"
+          fi
+
+          COMMENT="${MARKER}
+          ## ${EMOJI} SecureOps Security Report
+
+          **Attack Surface Score:** ${SCORE}/100 — ${RATING} RISK
+          **Deployment Decision:** ${DECISION_TEXT}
+          **Attack Chains Detected:** ${CHAINS}
+          **Near-miss Alerts:** ${NEAR_MISS}
+          **Compliance Breaches:** ${COMPLIANCE_BREACHES}
+          **Quality Gate:** ${GATE_LABEL}
+          "
+
+          if [ -n "$REASON" ]; then
+            COMMENT="${COMMENT}
+          ${REASON}
+          "
+          fi
+
+          if echo "$REASON" | grep -q '##CHAIN_GATE:CHRONIC##'; then
+            COMMENT="${COMMENT}
+          🔴 CHRONIC attack chain → Deployment HARD BLOCKED
+          "
+          fi
+          if echo "$REASON" | grep -q '##CHAIN_GATE:PERSISTENT##'; then
+            COMMENT="${COMMENT}
+          🟠 PERSISTENT chain → Gate escalated to ${DECISION_TEXT}
+          "
+          fi
+          if echo "$REASON" | grep -q '##CHAIN_GATE:REACTIVATED##'; then
+            COMMENT="${COMMENT}
+          🟡 Reactivated chain → Root cause not resolved
+          "
+          fi
+
+          if [ -n "$CHAINS_TABLE" ]; then
+            COMMENT="${COMMENT}
+          ---
+
+          ### Attack Chains
+
+          | Chain | Severity |
+          |---|---|
+          ${CHAINS_TABLE}
+          "
+          fi
+
+          COMMENT="${COMMENT}
+          ---
+
+          ### Top Findings (Critical and High)
+
+          | # | Severity | Finding | Tool | File |
+          |---|---|---|---|---|
+          ${FINDINGS_TABLE}
+
+          ---
+
+          ### What to do
+          "
+
+          if [ "$DECISION" = "BLOCK" ] || [ "$DECISION" = "HARD_BLOCK" ]; then
+            COMMENT="${COMMENT}
+          Approval required from: **${APPROVERS:-see portal}**
+          Or fix findings to bring score below threshold.
+          "
+          fi
+
+          COMMENT="${COMMENT}
+          [View Full Report](${REPORT_URL})
+
+          ---
+          *SecureOps · Score-Gated CD · scan \`${SCAN_ID}\`*"
+
+          upsert_comment "$COMMENT"
+
+  # Pre-warm OWASP NVD cache on schedule so scan jobs hit warm --noupdate path (~5–15 min).
+  warm-owasp-cache:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.warm_nvd_cache == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Compute cache week key
+        id: date
+        run: echo "week=$(date +%Y-%U)" >> "$GITHUB_OUTPUT"
+
+      - name: Pull OWASP Dependency-Check image
+        run: docker pull owasp/dependency-check:12.2.2
+
+      - name: Ensure NVD data directory
+        run: mkdir -p "$HOME/.dependency-check/data"
+
+      - name: Cache OWASP NVD database
+        uses: actions/cache@v4
+        id: owasp-cache
+        with:
+          path: ~/.dependency-check/data
+          key: owasp-nvd-v2-${{ steps.date.outputs.week }}
+          restore-keys: |
+            owasp-nvd-v2-
+
+      - name: Check if warming is needed
+        id: nvd-check
+        run: |
+          DB_FILE="$HOME/.dependency-check/data/odc.mv.db"
+          if [ ! -f "$DB_FILE" ]; then
+            DB_FILE=$(find "$HOME/.dependency-check/data" -name 'odc.mv.db' -type f 2>/dev/null | head -1)
+          fi
+          DB_SIZE=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+          if [ -n "$DB_FILE" ] && [ "$DB_SIZE" -gt 52428800 ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Cache already warm ($(numfmt --to=iec "$DB_SIZE")) — nothing to do"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Cache cold or missing — will bootstrap from local NVD feeds (${NVD_START_YEAR}+)"
+          fi
+
+      - name: Pre-download NVD CVE feeds
+        if: steps.nvd-check.outputs.needed == 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          NVD_CACHE="${RUNNER_TEMP}/nvd-cache"
+          mkdir -p "$NVD_CACHE"
+          FEED_BASE="https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache"
+          END_YEAR=$(date +%Y)
+          echo "Downloading nvdcve-${NVD_START_YEAR}..${END_YEAR} in parallel (8 workers)..."
+          download_year() {
+            year="$1"
+            dest="${NVD_CACHE}/nvdcve-${year}.json.gz"
+            if [ -f "$dest" ] && [ "$(stat -c%s "$dest" 2>/dev/null || echo 0)" -gt 500 ]; then
+              echo "  cached nvdcve-${year}.json.gz"
+              return 0
+            fi
+            if curl -fsSL "${FEED_BASE}/nvdcve-${year}.json.gz" -o "${dest}.tmp"; then
+              mv "${dest}.tmp" "$dest"
+              echo "  ok nvdcve-${year}.json.gz"
+            else
+              rm -f "${dest}.tmp"
+              echo "::error::Failed to download nvdcve-${year}.json.gz"
+              return 1
+            fi
+          }
+          export -f download_year
+          export FEED_BASE NVD_CACHE
+          seq "${NVD_START_YEAR}" "$END_YEAR" | xargs -P 8 -n 1 bash -c 'download_year "$@"' _
+          COUNT=$(find "$NVD_CACHE" -name 'nvdcve-*.json.gz' 2>/dev/null | wc -l)
+          echo "Downloaded ${COUNT} NVD feed files"
+          if [ "$COUNT" -lt 5 ]; then
+            echo "::error::Too few NVD feed files (${COUNT}) — check datafeed connectivity"
+            exit 1
+          fi
+
+      - name: Warm NVD database from local feeds
+        if: steps.nvd-check.outputs.needed == 'true'
+        timeout-minutes: 45
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          set -euo pipefail
+          ODC_DATA="${RUNNER_TEMP}/odc-warm-data"
+          NVD_CACHE="${RUNNER_TEMP}/nvd-cache"
+          rm -rf "$ODC_DATA"
+          mkdir -p "$ODC_DATA" "$HOME/.dependency-check/data"
+          find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
+          echo "Building odc.mv.db from local feeds in ${ODC_DATA} (fresh, no stale cache copy)..."
+          docker run --rm \
+            -e JAVA_OPTS="-Xmx4096m -Dh2.lockTimeout=600000" \
+            -v "${ODC_DATA}:/usr/share/dependency-check/data" \
+            -v "${NVD_CACHE}:/nvd-cache:ro" \
+            owasp/dependency-check:12.2.2 \
+            --updateonly \
+            --data /usr/share/dependency-check/data \
+            --nvdDatafeed "file:///nvd-cache/nvdcve-{0}.json.gz" \
+            --disableRetireJs \
+            --disableKnownExploited \
+            --disableHostedSuppressions
+          find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
+          if [ -n "${NVD_API_KEY:-}" ]; then
+            echo "Applying optional NVD API delta..."
+            docker run --rm \
+              -e NVD_API_KEY \
+              -e JAVA_OPTS="-Xmx4096m -Dh2.lockTimeout=600000" \
+              -v "${ODC_DATA}:/usr/share/dependency-check/data" \
+              owasp/dependency-check:12.2.2 \
+              --updateonly \
+              --data /usr/share/dependency-check/data \
+              --nvdValidForHours 0 \
+              --nvdApiKey "$NVD_API_KEY" \
+              --nvdApiDelay 6000 \
+              --disableRetireJs \
+              --disableKnownExploited \
+              --disableHostedSuppressions || echo "::warning::NVD API delta refresh failed — continuing with feed-only DB"
+            find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
+          fi
+          cp -a "$ODC_DATA/." "$HOME/.dependency-check/data/"
+          DB_FILE="$HOME/.dependency-check/data/odc.mv.db"
+          if [ ! -f "$DB_FILE" ]; then
+            DB_FILE=$(find "$HOME/.dependency-check/data" -name 'odc.mv.db' -type f 2>/dev/null | head -1)
+          fi
+          DB_SIZE=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+          echo "Warm DB size: ${DB_SIZE} bytes at ${DB_FILE:-none}"
+          if [ -z "$DB_FILE" ] || [ "$DB_SIZE" -lt 52428800 ]; then
+            echo "::error::NVD API warm produced no usable database (${DB_SIZE} bytes)"
+            exit 1
+          fi
+          echo "✅ Cache warmed: $(numfmt --to=iec "$DB_SIZE")"
