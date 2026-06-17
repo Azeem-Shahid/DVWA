@@ -2,7 +2,7 @@
 # PORTAL WORKFLOW TEMPLATE — SOURCE OF TRUTH FOR ALL CUSTOMER REPOS
 # ═══════════════════════════════════════════════════════════════════════════════
 # This file is the ONLY file to edit when changing what gets pushed to customer
-# GitHub repos (e.g. pwi) via Settings → Scanners → Re-commit workflow.
+# GitHub repos (e.g. DVWA) via Settings → Scanners → Re-commit workflow.
 #
 # Build path:  src/assets/secureops-workflow.yml
 #              → dist/assets/secureops-workflow.yml  (npm run build)
@@ -10,8 +10,9 @@
 # Output path: .github/workflows/secureops.yml  (in each customer's repo)
 #
 # Placeholders replaced at commit time:
-#   "master"  →  project default branch (e.g. "main")
-#   dvwa      →  project sonar key (e.g. "pwi")
+#   "master"      →  quoted branch for YAML triggers (e.g. "main")
+#   master  →  unquoted branch for refs/git (e.g. main)
+#   dvwa          →  project sonar key (e.g. "dvwa")
 #
 # GitHub Actions secrets (Settings → Secrets and variables → Actions):
 #   SECUREOPS_URL, SECUREOPS_API_KEY, SECUREOPS_PROJECT_ID — required for scans
@@ -80,7 +81,7 @@ env:
 
 jobs:
   notify-start:
-    if: github.event.inputs.deploy_only != 'true' && github.event.inputs.warm_nvd_cache != 'true'
+    if: github.event.inputs.deploy_only != 'true' && github.event.inputs.warm_nvd_cache != 'true' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     outputs:
       scan_id: ${{ steps.start.outputs.scan_id }}
@@ -246,6 +247,7 @@ jobs:
     needs: notify-start
     if: needs.notify-start.outputs.scan_id != '' && needs.notify-start.outputs.scan_id != 'null'
     continue-on-error: true
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -259,6 +261,7 @@ jobs:
           format: json
           output: trivy-results.json
           exit-code: "0"
+          ignore-unfixed: false
       - name: Send Trivy results to SecureOps
         if: always()
         run: |
@@ -292,8 +295,8 @@ jobs:
 
   # ─── OWASP DEPENDENCY-CHECK ──────────────────────────────────────────────────
   # Cache: ~/.dependency-check/data keyed by ISO week (odc.mv.db > 50 MB = warm).
-  # Warm path: --noupdate scan (~5–15 min). Cold path: single scan bootstraps NVD via API.
-  # NVD_API_KEY must be set in the customer GitHub repo (Settings → Secrets → Actions).
+  # Warm path: --noupdate scan (~5–15 min). Cold path: community datafeed mirror (no live NVD API).
+  # NVD_API_KEY optional — delta refresh only; cold bootstrap does not require it.
   owasp-scan:
     needs: notify-start
     if: needs.notify-start.outputs.scan_id != '' && needs.notify-start.outputs.scan_id != 'null'
@@ -320,9 +323,15 @@ jobs:
         id: owasp-cache
         with:
           path: ~/.dependency-check/data
-          key: owasp-nvd-v2-${{ steps.date.outputs.week }}
+          key: owasp-nvd-v3-${{ steps.date.outputs.week }}
           restore-keys: |
-            owasp-nvd-v2-
+            owasp-nvd-v3-
+
+      - name: Purge stale OWASP lock files from restored cache
+        run: |
+          find "$HOME/.dependency-check/data" -type f \
+            \( -name '*.lock.db' -o -name 'odc.update.lock' \) \
+            -delete 2>/dev/null || true
 
       - name: Check if NVD database is populated
         id: nvd-check
@@ -340,7 +349,7 @@ jobs:
             echo "✅ NVD database populated ($(numfmt --to=iec "$DB_SIZE")) — scan will use --noupdate"
           else
             echo "populated=false" >> "$GITHUB_OUTPUT"
-            echo "❌ NVD database missing or too small — purging stale cache and bootstrapping via NVD API"
+            echo "❌ NVD database missing or too small — purging stale cache; will bootstrap from community datafeed mirror"
             rm -rf "$HOME/.dependency-check/data"
             mkdir -p "$HOME/.dependency-check/data"
           fi
@@ -369,6 +378,105 @@ jobs:
           fi
           echo "paths=$SCAN_PATHS" >> "$GITHUB_OUTPUT"
 
+      - name: Pre-download NVD CVE feeds
+        id: nvd-datafeed-download
+        if: steps.nvd-check.outputs.populated != 'true'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          NVD_CACHE="${RUNNER_TEMP}/nvd-cache"
+          mkdir -p "$NVD_CACHE"
+          FEED_BASE="https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache"
+          END_YEAR=$(date +%Y)
+          echo "Downloading nvdcve-${NVD_START_YEAR}..${END_YEAR} in parallel (8 workers)..."
+          download_year() {
+            year="$1"
+            dest="${NVD_CACHE}/nvdcve-${year}.json.gz"
+            if [ -f "$dest" ] && [ "$(stat -c%s "$dest" 2>/dev/null || echo 0)" -gt 500 ]; then
+              echo "  cached nvdcve-${year}.json.gz"
+              return 0
+            fi
+            if curl -fsSL "${FEED_BASE}/nvdcve-${year}.json.gz" -o "${dest}.tmp"; then
+              mv "${dest}.tmp" "$dest"
+              echo "  ok nvdcve-${year}.json.gz"
+            else
+              rm -f "${dest}.tmp"
+              echo "::error::Failed to download nvdcve-${year}.json.gz"
+              return 1
+            fi
+          }
+          export -f download_year
+          export FEED_BASE NVD_CACHE
+          seq "${NVD_START_YEAR}" "$END_YEAR" | xargs -P 8 -n 1 bash -c 'download_year "$@"' _
+          COUNT=$(find "$NVD_CACHE" -name 'nvdcve-*.json.gz' 2>/dev/null | wc -l)
+          echo "Downloaded ${COUNT} NVD feed files"
+          if [ "$COUNT" -lt 5 ]; then
+            echo "::error::Too few NVD feed files (${COUNT}) — check datafeed connectivity"
+            echo "datafeed_ok=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "datafeed_ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build NVD database from local feeds
+        id: nvd-datafeed-build
+        if: steps.nvd-check.outputs.populated != 'true' && steps.nvd-datafeed-download.outputs.datafeed_ok == 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          ODC_DATA="${RUNNER_TEMP}/odc-warm-data"
+          NVD_CACHE="${RUNNER_TEMP}/nvd-cache"
+          rm -rf "$ODC_DATA"
+          mkdir -p "$ODC_DATA"
+          find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
+          echo "Building odc.mv.db from local feeds in ${ODC_DATA}..."
+          docker run --rm \
+            -e JAVA_OPTS="-Xmx4096m -Dh2.lockTimeout=600000" \
+            -v "${ODC_DATA}:/usr/share/dependency-check/data" \
+            -v "${NVD_CACHE}:/nvd-cache:ro" \
+            owasp/dependency-check:12.2.2 \
+            --updateonly \
+            --data /usr/share/dependency-check/data \
+            --nvdDatafeed "file:///nvd-cache/nvdcve-{0}.json.gz" \
+            --disableRetireJs \
+            --disableKnownExploited \
+            --disableHostedSuppressions
+          find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
+          DB_FILE=$(find "$ODC_DATA" -name 'odc.mv.db' -type f 2>/dev/null | head -1)
+          DB_SIZE=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+          if [ -n "$DB_FILE" ] && [ "$DB_SIZE" -gt 52428800 ]; then
+            echo "build_ok=true" >> "$GITHUB_OUTPUT"
+            echo "Built NVD database ($(numfmt --to=iec "$DB_SIZE"))"
+          else
+            echo "build_ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Datafeed build produced no usable database (${DB_SIZE} bytes)"
+            exit 1
+          fi
+
+      - name: Apply optional NVD API delta
+        if: steps.nvd-check.outputs.populated != 'true' && steps.nvd-datafeed-build.outputs.build_ok == 'true' && secrets.NVD_API_KEY != ''
+        timeout-minutes: 5
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          set -euo pipefail
+          ODC_DATA="${RUNNER_TEMP}/odc-warm-data"
+          echo "Applying optional NVD API delta..."
+          docker run --rm \
+            -e NVD_API_KEY \
+            -e JAVA_OPTS="-Xmx4096m -Dh2.lockTimeout=600000" \
+            -v "${ODC_DATA}:/usr/share/dependency-check/data" \
+            owasp/dependency-check:12.2.2 \
+            --updateonly \
+            --data /usr/share/dependency-check/data \
+            --nvdValidForHours 0 \
+            --nvdApiKey "$NVD_API_KEY" \
+            --nvdApiDelay 6000 \
+            --disableRetireJs \
+            --disableKnownExploited \
+            --disableHostedSuppressions || echo "::warning::NVD API delta refresh failed — continuing with feed-only DB"
+          find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
+
       - name: Run OWASP Dependency Check
         timeout-minutes: 55
         env:
@@ -379,19 +487,21 @@ jobs:
           ODC_DATA="${RUNNER_TEMP}/odc-scan-data"
           rm -rf "$ODC_DATA"
           mkdir -p "$ODC_DATA"
+          DATAFEED_BUILT="${{ steps.nvd-datafeed-build.outputs.build_ok }}"
           if [ "${{ steps.nvd-check.outputs.populated }}" = "true" ]; then
             cp -a "$HOME/.dependency-check/data/." "$ODC_DATA/"
+            echo "Warm cache — using restored NVD database"
+          elif [ "$DATAFEED_BUILT" = "true" ]; then
+            cp -a "${RUNNER_TEMP}/odc-warm-data/." "$ODC_DATA/"
+            echo "Cold cache — using NVD database built from community datafeed mirror"
           fi
           find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
           if [ -z "${NVD_API_KEY:-}" ]; then
-            echo "::warning::NVD_API_KEY is not set — cold bootstrap may produce zero CVEs"
+            echo "::warning::NVD_API_KEY not set — building NVD database from community datafeed mirror (no live API dependency); delta refresh skipped"
+          elif [ "$DATAFEED_BUILT" = "true" ]; then
+            echo "✅ NVD_API_KEY is set (delta may have been applied in prior step)"
           else
             echo "✅ NVD_API_KEY is set"
-          fi
-          if [ "${{ steps.nvd-check.outputs.populated }}" != "true" ]; then
-            echo "Cold cache — skipping pre-bootstrap; single scan process will update NVD (avoids H2 lock conflicts)"
-          else
-            echo "Warm cache — using restored NVD database"
           fi
           NOUPDATE_FLAG=""
           DB_FILE=$(find "$ODC_DATA" -name 'odc.mv.db' -type f 2>/dev/null | head -1)
@@ -400,6 +510,7 @@ jobs:
             NOUPDATE_FLAG="--noupdate"
             echo "Running OWASP dependency scan (--noupdate, DB $(numfmt --to=iec "$DB_SIZE"))..."
           else
+            echo "::warning::NVD datafeed mirror unavailable or incomplete — attempting best-effort live NVD API bootstrap during scan (may be slow or produce zero CVEs if API is down)"
             echo "Running OWASP dependency scan (cold DB — NVD update allowed during scan)..."
           fi
           docker run --rm \
@@ -490,6 +601,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+          fetch-depth: 0
       - name: Install Semgrep CLI
         run: python -m pip install --upgrade "semgrep==1.162.0"
       - name: Ensure Semgrep config exists
@@ -511,9 +623,11 @@ jobs:
               > .semgrep.yml
           fi
       - name: Run Semgrep local rules
+        env:
+          SEMGREP_RULES: .semgrep.yml
         run: |
           set -euo pipefail
-          semgrep scan --metrics=off --config .semgrep.yml --json --output semgrep-results.json || true
+          semgrep ci --metrics=off --json --output semgrep-results.json || true
       - name: Send Semgrep results to SecureOps
         if: always()
         run: |
@@ -546,6 +660,7 @@ jobs:
   gitleaks-scan:
     needs: notify-start
     if: needs.notify-start.outputs.scan_id != '' && needs.notify-start.outputs.scan_id != 'null'
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -558,7 +673,7 @@ jobs:
           docker run --rm \
             -v "$(pwd):/repo" \
             zricethezav/gitleaks:v8.24.3 \
-            detect --source /repo --report-format json --report-path /repo/gitleaks-results.json --exit-code 0
+            detect --source /repo --redact --report-format json --report-path /repo/gitleaks-results.json --exit-code 0
           test -f gitleaks-results.json || printf '[]\n' > gitleaks-results.json
       - name: Send Gitleaks results to SecureOps
         if: always()
@@ -662,7 +777,7 @@ jobs:
       github.event.inputs.deploy_only != 'true' &&
       needs.evaluate-quality-gate.result == 'success' &&
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/"master"'
+      github.ref == 'refs/heads/master'
     outputs:
       cd_enabled: ${{ steps.cd-check.outputs.cd_enabled }}
       decision: ${{ steps.check.outputs.decision || steps.cd-check.outputs.decision }}
@@ -677,10 +792,12 @@ jobs:
             echo "decision=APPROVE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          RESPONSE=$(curl -fsS ${SECUREOPS_CURL} \
+          if ! RESPONSE=$(curl -fsS ${SECUREOPS_CURL} \
             -H "X-API-Key: ${API_KEY}" \
-            "${SECUREOPS_URL}/api/projects/${PROJECT_ID}/attack-surface-score" \
-            || echo '{"cdPipelineEnabled":true,"deploymentDecision":"APPROVE"}')
+            "${SECUREOPS_URL}/api/projects/${PROJECT_ID}/attack-surface-score"); then
+            echo "::error::Cannot verify CD pipeline status — SecureOps portal unreachable. Deployment blocked until connectivity is restored."
+            exit 1
+          fi
           echo "cd_enabled=$(echo "$RESPONSE" | jq -r '.cdPipelineEnabled // true')" >> "$GITHUB_OUTPUT"
           echo "decision=$(echo "$RESPONSE" | jq -r '.deploymentDecision // "APPROVE"')" >> "$GITHUB_OUTPUT"
 
@@ -707,10 +824,12 @@ jobs:
             echo "::error::Missing scan_id for deploy-gate"
             exit 1
           fi
-          RESPONSE=$(curl -fsS ${SECUREOPS_CURL} \
+          if ! RESPONSE=$(curl -fsS ${SECUREOPS_CURL} \
             -H "X-API-Key: ${API_KEY}" \
-            "${SECUREOPS_URL}/api/projects/${PROJECT_ID}/scans/${SCAN_ID}/deployment-status" \
-            || echo '{"effectiveDecision":"APPROVE","score":0,"rating":"LOW"}')
+            "${SECUREOPS_URL}/api/projects/${PROJECT_ID}/scans/${SCAN_ID}/deployment-status"); then
+            echo "::error::Cannot verify deployment status — SecureOps portal unreachable. Deployment blocked until connectivity is restored."
+            exit 1
+          fi
           DECISION=$(echo "$RESPONSE" | jq -r '.effectiveDecision // "APPROVE"')
           SCORE=$(echo "$RESPONSE" | jq -r '.score // 0')
           RATING=$(echo "$RESPONSE" | jq -r '.rating // "LOW"')
@@ -799,7 +918,7 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             cd /opt/demo-app || cd /opt/secureops
-            git pull origin "master"
+            git pull origin master
             docker compose up -d --force-recreate backend frontend
             echo "Deployed at $(date)"
       - name: Health check
@@ -820,6 +939,10 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             cd /opt/demo-app || cd /opt/secureops
+            git rev-parse HEAD~1 >/dev/null 2>&1 || {
+              echo "::warning::No previous commit available to roll back to — leaving current (unhealthy) deployment in place. Manual intervention required."
+              exit 0
+            }
             git checkout HEAD~1
             docker compose up -d --force-recreate backend frontend
             echo "Rollback completed at $(date) — postgres container not recreated"
@@ -1024,9 +1147,15 @@ jobs:
         id: owasp-cache
         with:
           path: ~/.dependency-check/data
-          key: owasp-nvd-v2-${{ steps.date.outputs.week }}
+          key: owasp-nvd-v3-${{ steps.date.outputs.week }}
           restore-keys: |
-            owasp-nvd-v2-
+            owasp-nvd-v3-
+
+      - name: Purge stale OWASP lock files from restored cache
+        run: |
+          find "$HOME/.dependency-check/data" -type f \
+            \( -name '*.lock.db' -o -name 'odc.update.lock' \) \
+            -delete 2>/dev/null || true
 
       - name: Check if warming is needed
         id: nvd-check
