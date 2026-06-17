@@ -11,7 +11,7 @@
 #
 # Placeholders replaced at commit time:
 #   "master"  →  project default branch (e.g. "main")
-#   cmqhlsh7d7zzf2o0bw6yi1v98      →  project sonar key (e.g. "pwi")
+#   dvwa      →  project sonar key (e.g. "pwi")
 #
 # GitHub Actions secrets (Settings → Secrets and variables → Actions):
 #   SECUREOPS_URL, SECUREOPS_API_KEY, SECUREOPS_PROJECT_ID — required for scans
@@ -193,7 +193,7 @@ jobs:
           SONAR_HOST_URL: ${{ steps.sonar-url.outputs.url }}
         with:
           args: >
-            -Dsonar.projectKey=cmqhlsh7d7zzf2o0bw6yi1v98
+            -Dsonar.projectKey=dvwa
             -Dsonar.projectName=SecureOps-${{ env.PROJECT_ID }}
             -Dsonar.host.url=${{ steps.sonar-url.outputs.url }}
             -Dsonar.sources=.
@@ -212,7 +212,7 @@ jobs:
           set -euo pipefail
           BASE="${{ steps.sonar-url.outputs.url }}"
           BASE="${BASE%/}"
-          SONAR_KEY="cmqhlsh7d7zzf2o0bw6yi1v98"
+          SONAR_KEY="dvwa"
           HTTP=""
           for i in $(seq 1 6); do
             HTTP=$(curl -sS -o /tmp/sonar-issues.json -w "%{http_code}" \
