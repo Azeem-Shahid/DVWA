@@ -454,12 +454,16 @@ jobs:
           fi
 
       - name: Apply optional NVD API delta
-        if: steps.nvd-check.outputs.populated != 'true' && steps.nvd-datafeed-build.outputs.build_ok == 'true' && secrets.NVD_API_KEY != ''
+        if: steps.nvd-check.outputs.populated != 'true' && steps.nvd-datafeed-build.outputs.build_ok == 'true'
         timeout-minutes: 5
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           set -euo pipefail
+          if [ -z "${NVD_API_KEY:-}" ]; then
+            echo "NVD_API_KEY not set — skipping optional API delta"
+            exit 0
+          fi
           ODC_DATA="${RUNNER_TEMP}/odc-warm-data"
           echo "Applying optional NVD API delta..."
           docker run --rm \
