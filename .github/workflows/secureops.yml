@@ -10,8 +10,8 @@
 # Output path: .github/workflows/secureops.yml  (in each customer's repo)
 #
 # Placeholders replaced at commit time:
-#   __SECUREOPS_SCAN_BRANCH__  →  project default branch (e.g. "main")
-#   __SONAR_PROJECT_KEY__      →  project sonar key (e.g. "pwi")
+#   "master"  →  project default branch (e.g. "main")
+#   cmqhlsh7d7zzf2o0bw6yi1v98      →  project sonar key (e.g. "pwi")
 #
 # GitHub Actions secrets (Settings → Secrets and variables → Actions):
 #   SECUREOPS_URL, SECUREOPS_API_KEY, SECUREOPS_PROJECT_ID — required for scans
@@ -26,9 +26,9 @@ name: SecureOps Security Pipeline
 
 on:
   push:
-    branches: [__SECUREOPS_SCAN_BRANCH__]
+    branches: ["master"]
   pull_request:
-    branches: [__SECUREOPS_SCAN_BRANCH__]
+    branches: ["master"]
   schedule:
     - cron: '0 3 * * 0'  # Sunday 03:00 UTC — pre-warm NVD cache before Monday scans
   workflow_dispatch:
@@ -57,12 +57,13 @@ permissions:
   security-events: write
 
 # Portal manual scans use a per-scan group so a push/PR on main does not cancel them mid-run.
-# Push/PR still share one group per ref so rapid commits only keep the latest CI run.
+# Push/PR share one group per ref+sha so re-runs of the same commit dedupe, but a new push
+# does not cancel an in-flight Sonar analysis from a prior commit on the same branch.
 concurrency:
   group: >-
     ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.scan_id != '')
     && format('secureops-portal-{0}', github.event.inputs.scan_id)
-    || format('secureops-ref-{0}', github.ref) }}
+    || format('secureops-ref-{0}-{1}', github.ref, github.sha) }}
   cancel-in-progress: >-
     ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.scan_id == '' }}
 
@@ -192,7 +193,7 @@ jobs:
           SONAR_HOST_URL: ${{ steps.sonar-url.outputs.url }}
         with:
           args: >
-            -Dsonar.projectKey=__SONAR_PROJECT_KEY__
+            -Dsonar.projectKey=cmqhlsh7d7zzf2o0bw6yi1v98
             -Dsonar.projectName=SecureOps-${{ env.PROJECT_ID }}
             -Dsonar.host.url=${{ steps.sonar-url.outputs.url }}
             -Dsonar.sources=.
@@ -211,7 +212,7 @@ jobs:
           set -euo pipefail
           BASE="${{ steps.sonar-url.outputs.url }}"
           BASE="${BASE%/}"
-          SONAR_KEY="__SONAR_PROJECT_KEY__"
+          SONAR_KEY="cmqhlsh7d7zzf2o0bw6yi1v98"
           HTTP=""
           for i in $(seq 1 6); do
             HTTP=$(curl -sS -o /tmp/sonar-issues.json -w "%{http_code}" \
@@ -388,33 +389,22 @@ jobs:
             echo "✅ NVD_API_KEY is set"
           fi
           if [ "${{ steps.nvd-check.outputs.populated }}" != "true" ]; then
-            echo "Cold cache — bootstrapping NVD via API (from ${NVD_START_YEAR})..."
-            docker run --rm \
-              -e NVD_API_KEY \
-              -e JAVA_OPTS="-Xmx4096m -Dh2.lockTimeout=600000" \
-              -v "${ODC_DATA}:/usr/share/dependency-check/data" \
-              owasp/dependency-check:12.2.2 \
-              --updateonly \
-              --data /usr/share/dependency-check/data \
-              --nvdApiStartYear "${NVD_START_YEAR}" \
-              --nvdValidForHours 0 \
-              --nvdApiKey "${NVD_API_KEY:-}" \
-              --nvdApiDelay 6000 \
-              --disableRetireJs \
-              --disableKnownExploited \
-              --disableHostedSuppressions \
-            || echo "::warning::NVD API bootstrap failed — scan may produce empty report"
-            find "$ODC_DATA" -type f \( -name '*.lock.db' -o -name 'odc.update.lock' \) -delete 2>/dev/null || true
-            DB_FILE=$(find "$ODC_DATA" -name 'odc.mv.db' -type f 2>/dev/null | head -1)
-            DB_SIZE=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
-            echo "Bootstrap DB: ${DB_SIZE} bytes at ${DB_FILE:-none}"
+            echo "Cold cache — skipping pre-bootstrap; single scan process will update NVD (avoids H2 lock conflicts)"
           else
-            echo "Warm cache — skipping NVD bootstrap"
+            echo "Warm cache — using restored NVD database"
           fi
-          echo "Running OWASP dependency scan (--noupdate)..."
+          NOUPDATE_FLAG=""
+          DB_FILE=$(find "$ODC_DATA" -name 'odc.mv.db' -type f 2>/dev/null | head -1)
+          DB_SIZE=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+          if [ -n "$DB_FILE" ] && [ "$DB_SIZE" -gt 52428800 ]; then
+            NOUPDATE_FLAG="--noupdate"
+            echo "Running OWASP dependency scan (--noupdate, DB $(numfmt --to=iec "$DB_SIZE"))..."
+          else
+            echo "Running OWASP dependency scan (cold DB — NVD update allowed during scan)..."
+          fi
           docker run --rm \
             -e NVD_API_KEY \
-            -e JAVA_OPTS="-Xmx4096m" \
+            -e JAVA_OPTS="-Xmx4096m -Dh2.lockTimeout=600000" \
             -v "${{ github.workspace }}:/src" \
             -v "${ODC_DATA}:/usr/share/dependency-check/data" \
             -v "${{ github.workspace }}/owasp-report:/report" \
@@ -425,7 +415,7 @@ jobs:
             --data /usr/share/dependency-check/data \
             --failOnCVSS 11 \
             --nvdApiKey "$NVD_API_KEY" \
-            --noupdate \
+            $NOUPDATE_FLAG \
             --disableRetireJs \
             --disableOssIndex \
             --disableVersionCheck \
@@ -672,7 +662,7 @@ jobs:
       github.event.inputs.deploy_only != 'true' &&
       needs.evaluate-quality-gate.result == 'success' &&
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/__SECUREOPS_SCAN_BRANCH__'
+      github.ref == 'refs/heads/"master"'
     outputs:
       cd_enabled: ${{ steps.cd-check.outputs.cd_enabled }}
       decision: ${{ steps.check.outputs.decision || steps.cd-check.outputs.decision }}
@@ -809,7 +799,7 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             cd /opt/demo-app || cd /opt/secureops
-            git pull origin __SECUREOPS_SCAN_BRANCH__
+            git pull origin "master"
             docker compose up -d --force-recreate backend frontend
             echo "Deployed at $(date)"
       - name: Health check
