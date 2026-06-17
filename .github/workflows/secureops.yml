@@ -76,7 +76,8 @@ env:
   SECUREOPS_FRONTEND_URL: ${{ secrets.SECUREOPS_FRONTEND_URL }}
   CHECKOUT_REF: ${{ github.event.inputs.branch || github.ref }}
   # Retries help when GitHub-hosted runners hit transient VPS/network blips (curl exit 28).
-  SECUREOPS_CURL: --retry 10 --retry-delay 15 --retry-all-errors --connect-timeout 30 --max-time 600
+  # Keep retry count modest — 10×30s connect timeouts flood logs when the portal is down.
+  SECUREOPS_CURL: --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 20 --max-time 300
   NVD_START_YEAR: "2018"
 
 jobs:
@@ -266,6 +267,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          sleep $(( RANDOM % 10 ))
           SCAN_ID="${{ needs.notify-start.outputs.scan_id }}"
           post_results() {
             local tool="$1" file="$2"
@@ -568,6 +570,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          sleep $(( 15 + RANDOM % 10 ))
           SCAN_ID="${{ needs.notify-start.outputs.scan_id }}"
           post_results() {
             local tool="$1" file="$2"
@@ -636,6 +639,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          sleep $(( 8 + RANDOM % 10 ))
           SCAN_ID="${{ needs.notify-start.outputs.scan_id }}"
           post_results() {
             local tool="$1" file="$2"
@@ -683,6 +687,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          sleep $(( 22 + RANDOM % 10 ))
           SCAN_ID="${{ needs.notify-start.outputs.scan_id }}"
           post_results() {
             local tool="$1" file="$2"
